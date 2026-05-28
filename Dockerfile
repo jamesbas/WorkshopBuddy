@@ -1,0 +1,84 @@
+# Base image: official Node 20 on Debian Bookworm slim. We previously used
+# `mcr.microsoft.com/azurelinux/base/nodejs:20` to dodge Docker Hub anonymous
+# pull rate limits on ACR shared build agents, but Azure Linux 3's libc / icu
+# combo segfaults Prisma 6's query-engine binary during `prisma generate`
+# (signal SIGSEGV at ~1s, both N-API and binary engineType). Debian slim is
+# Prisma's primary tested target and is fine on a developer machine. For ACR
+# remote builds, override at build time via `--build-arg BASE_IMAGE=...`.
+ARG BASE_IMAGE=node:20-bookworm-slim
+
+# --- deps ---
+FROM ${BASE_IMAGE} AS deps
+WORKDIR /app
+# openssl / ca-certificates: required by @prisma/engines and HTTPS pulls.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY package.json package-lock.json* ./
+COPY prisma ./prisma
+# `npm ci` for reproducible installs from package-lock.json (faster than
+# `npm install`, fails fast on lockfile drift). BuildKit cache mount keeps
+# the npm cache warm across local rebuilds; ignored by ACR remote build but
+# harmless there.
+# --ignore-scripts skips the `postinstall: prisma generate` hook here; the
+# builder stage runs `prisma generate` explicitly after copying the full
+# source. Avoids a Prisma 6 segfault under Azure Linux 3 node:20 when
+# generate runs as a postinstall sub-shell.
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --no-audit --no-fund --ignore-scripts
+
+# --- build ---
+FROM ${BASE_IMAGE} AS builder
+WORKDIR /app
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+ENV NEXT_TELEMETRY_DISABLED=1
+# Dummy DATABASE_URL so Next.js page-data collection can import API routes that
+# build a Prisma client at module load. Real DATABASE_URL is injected at runtime.
+ENV DATABASE_URL=postgresql://build@localhost:5432/build?sslmode=disable
+RUN npx prisma generate
+RUN npm run build
+
+# --- runtime ---
+FROM ${BASE_IMAGE} AS runner
+WORKDIR /app
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssl ca-certificates wget \
+ && rm -rf /var/lib/apt/lists/*
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV PORT=80
+ENV HOSTNAME=0.0.0.0
+# DATABASE_URL (postgres + Entra auth) and AZURE_CLIENT_ID are injected by the
+# Container App at runtime. start.js seeds (idempotent) and launches Next.js.
+# Schema migrations are NOT run here — they run in the azd `predeploy` hook
+# via `prisma migrate deploy` (see azure.yaml, P0-3).
+
+# Standalone Next.js output + full node_modules (start.js, seed.js, and
+# the driver-adapter Prisma client require pg / @prisma/adapter-pg /
+# @azure/identity, which Next.js's trace does not pick up because those
+# scripts run outside the Next.js server entrypoint).
+COPY --from=builder /app/.next/standalone ./
+COPY --from=builder /app/.next/static ./.next/static
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/prisma ./prisma
+COPY --from=builder /app/start.js ./start.js
+COPY --from=builder /app/node_modules ./node_modules
+# Worker (Service Bus consumer + sweeper) ships in the same image; Container
+# Apps Jobs run it via `tsx worker/agent-run-worker.ts` / `node worker/sweeper.js`.
+# It needs src/ + tsconfig.json so tsx can resolve `@/*` path aliases.
+COPY --from=builder /app/worker ./worker
+COPY --from=builder /app/src ./src
+COPY --from=builder /app/tsconfig.json ./tsconfig.json
+COPY --from=builder /app/next-env.d.ts ./next-env.d.ts
+
+EXPOSE 80
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD wget -qO- http://localhost:80/api/health || exit 1
+
+# Fetch an Entra token (via the seed/server adapters), seed the DB if empty,
+# then start Next.js. Schema migrations run out-of-band (see azure.yaml).
+CMD ["node", "start.js"]

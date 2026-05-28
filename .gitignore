@@ -10,6 +10,10 @@ out/
 .env.local
 .env.*.local
 
+# --- azd local environment state ---
+.azure/
+**/.azure/
+
 # --- build / deploy logs ---
 *.log
 deploy-output.log
@@ -45,7 +49,12 @@ node_modules.acrhidden/
 
 # Local log captures
 log-archive/
-innovate-impact/log-archive/
+
+# --- Local backlog (working notes, not part of the codebase) ---
+BACKLOG.md
+
+# --- TypeScript incremental build cache ---
+tsconfig.tsbuildinfo
 
 # --- Local diagnostic artifacts (ad-hoc captures from PowerShell sessions) ---
 clogs*.txt
